@@ -673,7 +673,7 @@ jobs:
                       return;
                   }
 
-                  var lstAll = JsonUtils.Deserialize<List<ProfileItem>>(JsonUtils.Serialize(all.OrderBy(t => t.Sort).ToList()));
+                  var lstAll = JsonUtils.Deserialize<List<ProfileItem>>(JsonUtils.Serialize(all));
                   if (lstAll is null || lstAll.Count <= 0)
                   {
                       return;
