@@ -1,0 +1,849 @@
+name: Build Connected21 Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Write Connected21 files
+        run: |
+          D=c21src
+          mkdir -p "$D"
+          cat > "$D/C21.cs" <<'C21_EOF'
+          using System.Windows.Media;
+          using MaterialDesignColors;
+          using MaterialDesignColors.ColorManipulation;
+          using MaterialDesignThemes.Wpf;
+
+          namespace v2rayN;
+
+          /// <summary>Connected21 branding helpers: themes, ping line colours, sponsor timing.</summary>
+          public static class C21
+          {
+              public const string TelegramUrl = "https://t.me/Vpn_Store21";
+
+              public static readonly SolidColorBrush PingGreen = new(Color.FromRgb(0x34, 0xD3, 0x99));
+              public static readonly SolidColorBrush PingRed = new(Color.FromRgb(0xFF, 0x4D, 0x6D));
+
+              private static readonly PaletteHelper Palette = new();
+              private static DispatcherTimer? _pulseTimer;
+              private static DispatcherTimer? _dynamicTimer;
+              private static double _hue;
+              private static double _phase;
+              private static string _themeId = "current";
+
+              public static event Action<string>? ThemeChanged;
+
+              public static string ThemeId => _themeId;
+
+              // ---------- tiny settings file ----------
+
+              private static string SettingsFile => Utils.GetConfigPath("connected21.ini");
+
+              public static string GetSetting(string key, string defaultValue = "")
+              {
+                  try
+                  {
+                      var file = SettingsFile;
+                      if (!File.Exists(file))
+                      {
+                          return defaultValue;
+                      }
+                      foreach (var line in File.ReadAllLines(file))
+                      {
+                          var i = line.IndexOf('=');
+                          if (i > 0 && line.Substring(0, i) == key)
+                          {
+                              return line.Substring(i + 1);
+                          }
+                      }
+                  }
+                  catch
+                  {
+                      // ignore
+                  }
+                  return defaultValue;
+              }
+
+              public static void SetSetting(string key, string value)
+              {
+                  try
+                  {
+                      var dict = new Dictionary<string, string>();
+                      var file = SettingsFile;
+                      if (File.Exists(file))
+                      {
+                          foreach (var line in File.ReadAllLines(file))
+                          {
+                              var i = line.IndexOf('=');
+                              if (i > 0)
+                              {
+                                  dict[line.Substring(0, i)] = line.Substring(i + 1);
+                              }
+                          }
+                      }
+                      dict[key] = value;
+                      File.WriteAllLines(file, dict.Select(kv => kv.Key + "=" + kv.Value));
+                  }
+                  catch
+                  {
+                      // ignore
+                  }
+              }
+
+              // ---------- ping line brushes (pulsing) ----------
+
+              public static void EnsureResources()
+              {
+                  var res = Application.Current?.Resources;
+                  if (res == null)
+                  {
+                      return;
+                  }
+                  res["C21PingGreen"] = PingGreen;
+                  res["C21PingRed"] = PingRed;
+
+                  if (_pulseTimer != null)
+                  {
+                      return;
+                  }
+                  _pulseTimer = new DispatcherTimer(DispatcherPriority.Background)
+                  {
+                      Interval = TimeSpan.FromMilliseconds(90)
+                  };
+                  _pulseTimer.Tick += (_, _) =>
+                  {
+                      _phase += 0.09;
+                      var g = 0.55 + 0.45 * Math.Sin(_phase * 1.6);
+                      var r = 0.55 + 0.45 * Math.Sin(_phase * 3.4);
+                      PingGreen.Color = Color.FromArgb(ToByte(255 * g), 0x34, 0xD3, 0x99);
+                      PingRed.Color = Color.FromArgb(ToByte(255 * r), 0xFF, 0x4D, 0x6D);
+                  };
+                  _pulseTimer.Start();
+              }
+
+              private static byte ToByte(double v) => (byte)Math.Clamp((int)v, 0, 255);
+
+              // ---------- themes: current, black, white, dynamic ----------
+
+              public static void ApplyTheme(string id, bool save = true)
+              {
+                  _themeId = id;
+                  if (save)
+                  {
+                      SetSetting("theme", id);
+                  }
+                  _dynamicTimer?.Stop();
+
+                  switch (id)
+                  {
+                      case "black":
+                          ApplyScheme(true, Color.FromRgb(255, 255, 255), Color.FromRgb(0xBD, 0xBD, 0xBD),
+                              Color.FromRgb(0, 0, 0), Color.FromRgb(0x0A, 0x0A, 0x0A), true);
+                          break;
+
+                      case "white":
+                          ApplyScheme(false, Color.FromRgb(0x6D, 0x28, 0xD9), Color.FromRgb(0x8B, 0x5C, 0xF6),
+                              Color.FromRgb(255, 255, 255), Color.FromRgb(0xFA, 0xF7, 0xFF), true);
+                          break;
+
+                      case "dynamic":
+                          StartDynamic();
+                          break;
+
+                      default:
+                          ApplyScheme(true, Color.FromRgb(0x7C, 0x5C, 0xFF), Color.FromRgb(0x22, 0xD3, 0xEE),
+                              Color.FromRgb(0x07, 0x0B, 0x1A), Color.FromRgb(0x0E, 0x14, 0x30), true);
+                          break;
+                  }
+                  ThemeChanged?.Invoke(id);
+              }
+
+              private static void ApplyScheme(bool dark, Color primary, Color secondary, Color paper, Color card, bool updateBorder)
+              {
+                  var theme = Palette.GetTheme();
+                  theme.SetBaseTheme(dark ? BaseTheme.Dark : BaseTheme.Light);
+                  theme.PrimaryLight = new ColorPair(primary.Lighten());
+                  theme.PrimaryMid = new ColorPair(primary);
+                  theme.PrimaryDark = new ColorPair(primary.Darken());
+                  theme.SecondaryMid = new ColorPair(secondary);
+                  SetColor(theme, "Paper", paper);
+                  SetColor(theme, "Background", paper);
+                  SetColor(theme, "CardBackground", card);
+                  SetColor(theme, "ToolBarBackground", card);
+                  Palette.SetTheme(theme);
+
+                  if (updateBorder)
+                  {
+                      try
+                      {
+                          WindowsUtils.SetDarkBorder(Application.Current.MainWindow, dark ? nameof(ETheme.Dark) : nameof(ETheme.Light));
+                      }
+                      catch
+                      {
+                          // ignore
+                      }
+                  }
+              }
+
+              private static void SetColor(object theme, string name, Color color)
+              {
+                  try
+                  {
+                      theme.GetType().GetProperty(name)?.SetValue(theme, color);
+                  }
+                  catch
+                  {
+                      // property not present in this Material Design version
+                  }
+              }
+
+              private static void StartDynamic()
+              {
+                  _dynamicTimer ??= new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+                  _dynamicTimer.Tick -= DynamicTick;
+                  _dynamicTimer.Tick += DynamicTick;
+                  _dynamicTimer.Start();
+                  DynamicTick(null, EventArgs.Empty);
+                  try
+                  {
+                      WindowsUtils.SetDarkBorder(Application.Current.MainWindow, nameof(ETheme.Dark));
+                  }
+                  catch
+                  {
+                      // ignore
+                  }
+              }
+
+              private static void DynamicTick(object? sender, EventArgs e)
+              {
+                  _hue = (_hue + 2.5) % 360;
+                  ApplyScheme(true, FromHsv(_hue, 0.55, 1.0), FromHsv(_hue + 50, 0.6, 1.0),
+                      FromHsv(_hue, 0.6, 0.07), FromHsv(_hue, 0.6, 0.13), false);
+              }
+
+              private static Color FromHsv(double hue, double saturation, double value)
+              {
+                  hue = ((hue % 360) + 360) % 360;
+                  var c = value * saturation;
+                  var x = c * (1 - Math.Abs((hue / 60) % 2 - 1));
+                  var m = value - c;
+                  double r, g, b;
+                  if (hue < 60) { r = c; g = x; b = 0; }
+                  else if (hue < 120) { r = x; g = c; b = 0; }
+                  else if (hue < 180) { r = 0; g = c; b = x; }
+                  else if (hue < 240) { r = 0; g = x; b = c; }
+                  else if (hue < 300) { r = x; g = 0; b = c; }
+                  else { r = c; g = 0; b = x; }
+                  return Color.FromRgb(ToByte((r + m) * 255), ToByte((g + m) * 255), ToByte((b + m) * 255));
+              }
+
+              // ---------- main window hook ----------
+
+              public static void OnMainWindowLoaded(Window owner)
+              {
+                  try
+                  {
+                      EnsureResources();
+                      ApplyTheme(GetSetting("theme", "current"), false);
+                      owner.Title = "Connected21";
+                  }
+                  catch (Exception ex)
+                  {
+                      Logging.SaveLog("C21 theme", ex);
+                  }
+
+                  owner.Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, new Action(() =>
+                  {
+                      try
+                      {
+                          if (!owner.IsVisible)
+                          {
+                              return;
+                          }
+                          long.TryParse(GetSetting("sponsor_last", "0"), out var last);
+                          var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                          if (now - last < 6 * 3600)
+                          {
+                              return;
+                          }
+                          SetSetting("sponsor_last", now.ToString());
+                          new Views.C21SponsorWindow { Owner = owner }.Show();
+                      }
+                      catch (Exception ex)
+                      {
+                          Logging.SaveLog("C21 sponsor", ex);
+                      }
+                  }));
+              }
+          }
+          C21_EOF
+          cat > "$D/C21Views.cs" <<'C21_EOF'
+          using System.Windows.Controls;
+          using System.Windows.Media;
+          using System.Windows.Media.Effects;
+
+          namespace v2rayN.Views;
+
+          internal static class C21Ui
+          {
+              public static SolidColorBrush Hex(string hex)
+                  => new((Color)ColorConverter.ConvertFromString(hex));
+
+              public static LinearGradientBrush BrandGradient()
+              {
+                  var brush = new LinearGradientBrush
+                  {
+                      StartPoint = new Point(0, 0),
+                      EndPoint = new Point(1, 1)
+                  };
+                  brush.GradientStops.Add(new GradientStop(Color.FromRgb(0x12, 0x06, 0x3B), 0.0));
+                  brush.GradientStops.Add(new GradientStop(Color.FromRgb(0x5B, 0x21, 0xB6), 0.5));
+                  brush.GradientStops.Add(new GradientStop(Color.FromRgb(0x08, 0x91, 0xB2), 1.0));
+                  return brush;
+              }
+
+              public static TextBlock Text(string text, double size, string hex, bool bold, double top = 0)
+                  => new()
+                  {
+                      Text = text,
+                      FontSize = size,
+                      Foreground = Hex(hex),
+                      FontWeight = bold ? FontWeights.Bold : FontWeights.Normal,
+                      TextAlignment = TextAlignment.Center,
+                      TextWrapping = TextWrapping.Wrap,
+                      HorizontalAlignment = HorizontalAlignment.Center,
+                      Margin = new Thickness(0, top, 0, 0)
+                  };
+
+              public static void OpenTelegram()
+              {
+                  try
+                  {
+                      ProcUtils.ProcessStart(C21.TelegramUrl);
+                  }
+                  catch
+                  {
+                      // ignore
+                  }
+              }
+          }
+
+          /// <summary>Sponsor pop-up, shown at most once every 6 hours.</summary>
+          public sealed class C21SponsorWindow : Window
+          {
+              public C21SponsorWindow()
+              {
+                  WindowStyle = WindowStyle.None;
+                  AllowsTransparency = true;
+                  Background = Brushes.Transparent;
+                  ResizeMode = ResizeMode.NoResize;
+                  SizeToContent = SizeToContent.WidthAndHeight;
+                  WindowStartupLocation = WindowStartupLocation.CenterOwner;
+                  ShowInTaskbar = false;
+                  Title = "Connected21";
+
+                  var panel = new StackPanel
+                  {
+                      Width = 320,
+                      Margin = new Thickness(28),
+                      FlowDirection = FlowDirection.RightToLeft
+                  };
+                  panel.Children.Add(C21Ui.Text("✦", 34, "#FBBF24", false));
+                  panel.Children.Add(C21Ui.Text("اسپانسر رسمی Connected21", 13, "#B8E6FF", false, 4));
+                  panel.Children.Add(C21Ui.Text("کانفیگ اختصاصی\nبدون قطعی", 26, "#FFFFFF", true, 14));
+                  panel.Children.Add(C21Ui.Text("با پایین‌ترین قیمت بازار\nخرید سریع و پشتیبانی همیشگی", 14, "#E5E7EB", false, 12));
+                  panel.Children.Add(C21Ui.Text("@Vpn_Store21", 19, "#FBBF24", true, 14));
+
+                  var button = new Border
+                  {
+                      Background = Brushes.White,
+                      CornerRadius = new CornerRadius(18),
+                      Height = 48,
+                      Margin = new Thickness(0, 20, 0, 0),
+                      Cursor = Cursors.Hand,
+                      Child = new TextBlock
+                      {
+                          Text = "عضویت و خرید در تلگرام",
+                          FontSize = 16,
+                          FontWeight = FontWeights.Bold,
+                          Foreground = C21Ui.Hex("#12063B"),
+                          HorizontalAlignment = HorizontalAlignment.Center,
+                          VerticalAlignment = VerticalAlignment.Center
+                      }
+                  };
+                  button.MouseLeftButtonUp += (_, _) =>
+                  {
+                      C21Ui.OpenTelegram();
+                      Close();
+                  };
+                  panel.Children.Add(button);
+
+                  var later = C21Ui.Text("بعداً", 14, "#CBD5E1", false, 14);
+                  later.Cursor = Cursors.Hand;
+                  later.MouseLeftButtonUp += (_, _) => Close();
+                  panel.Children.Add(later);
+
+                  Content = new Border
+                  {
+                      CornerRadius = new CornerRadius(26),
+                      Background = C21Ui.BrandGradient(),
+                      Margin = new Thickness(16),
+                      Effect = new DropShadowEffect { BlurRadius = 24, Opacity = 0.5, ShadowDepth = 0 },
+                      Child = panel
+                  };
+
+                  MouseLeftButtonDown += (_, _) =>
+                  {
+                      try
+                      {
+                          DragMove();
+                      }
+                      catch
+                      {
+                          // ignore
+                      }
+                  };
+                  KeyDown += (_, e) =>
+                  {
+                      if (e.Key == Key.Escape)
+                      {
+                          Close();
+                      }
+                  };
+              }
+          }
+
+          /// <summary>Permanent strip under the toolbar: sponsor text, Telegram button and the four theme dots.</summary>
+          public sealed class C21Banner : UserControl
+          {
+              private readonly List<(string Id, Border Dot)> _dots = new();
+
+              public C21Banner()
+              {
+                  var dock = new DockPanel { LastChildFill = true };
+
+                  var dotsPanel = new StackPanel
+                  {
+                      Orientation = Orientation.Horizontal,
+                      VerticalAlignment = VerticalAlignment.Center,
+                      Margin = new Thickness(10, 0, 0, 0)
+                  };
+                  DockPanel.SetDock(dotsPanel, Dock.Right);
+                  AddDot(dotsPanel, "current", "تم فعلی", Gradient("#7C5CFF", "#22D3EE"));
+                  AddDot(dotsPanel, "black", "تم سیاه", Gradient("#000000", "#2A2A2A"));
+                  AddDot(dotsPanel, "white", "تم سفید", Gradient("#FFFFFF", "#E8DDFF"));
+                  AddDot(dotsPanel, "dynamic", "تم داینامیک", Rainbow());
+                  dock.Children.Add(dotsPanel);
+
+                  var pill = new Border
+                  {
+                      Background = new SolidColorBrush(Color.FromArgb(0x33, 255, 255, 255)),
+                      CornerRadius = new CornerRadius(10),
+                      Padding = new Thickness(12, 4, 12, 4),
+                      VerticalAlignment = VerticalAlignment.Center,
+                      Cursor = Cursors.Hand,
+                      ToolTip = "تلگرام: " + C21.TelegramUrl,
+                      Child = new TextBlock
+                      {
+                          Text = "@Vpn_Store21  ←  خرید کانفیگ",
+                          FontWeight = FontWeights.Bold,
+                          Foreground = C21Ui.Hex("#FBBF24")
+                      }
+                  };
+                  pill.MouseLeftButtonUp += (_, e) =>
+                  {
+                      C21Ui.OpenTelegram();
+                      e.Handled = true;
+                  };
+                  DockPanel.SetDock(pill, Dock.Right);
+                  dock.Children.Add(pill);
+
+                  dock.Children.Add(new TextBlock
+                  {
+                      Text = "✦  اسپانسر رسمی   |   کانفیگ اختصاصی بدون قطعی   |   پایین‌ترین قیمت بازار",
+                      Foreground = Brushes.White,
+                      FontWeight = FontWeights.SemiBold,
+                      FlowDirection = FlowDirection.RightToLeft,
+                      TextTrimming = TextTrimming.CharacterEllipsis,
+                      VerticalAlignment = VerticalAlignment.Center,
+                      Cursor = Cursors.Hand
+                  });
+                  dock.MouseLeftButtonUp += (_, e) =>
+                  {
+                      if (e.OriginalSource is TextBlock)
+                      {
+                          C21Ui.OpenTelegram();
+                      }
+                  };
+
+                  Content = new Border
+                  {
+                      Background = C21Ui.BrandGradient(),
+                      CornerRadius = new CornerRadius(14),
+                      Margin = new Thickness(10, 6, 10, 2),
+                      Padding = new Thickness(14, 8, 10, 8),
+                      Child = dock
+                  };
+
+                  C21.ThemeChanged += Refresh;
+                  Loaded += (_, _) => Refresh(C21.ThemeId);
+                  Unloaded += (_, _) => C21.ThemeChanged -= Refresh;
+              }
+
+              private static LinearGradientBrush Gradient(string a, string b)
+              {
+                  var brush = new LinearGradientBrush
+                  {
+                      StartPoint = new Point(0, 0),
+                      EndPoint = new Point(1, 1)
+                  };
+                  brush.GradientStops.Add(new GradientStop(C21Ui.Hex(a).Color, 0));
+                  brush.GradientStops.Add(new GradientStop(C21Ui.Hex(b).Color, 1));
+                  return brush;
+              }
+
+              private static LinearGradientBrush Rainbow()
+              {
+                  var brush = new LinearGradientBrush
+                  {
+                      StartPoint = new Point(0, 0),
+                      EndPoint = new Point(1, 1)
+                  };
+                  var colors = new[] { "#FF5C8A", "#FBBF24", "#34D399", "#22D3EE", "#7C5CFF" };
+                  for (var i = 0; i < colors.Length; i++)
+                  {
+                      brush.GradientStops.Add(new GradientStop(C21Ui.Hex(colors[i]).Color, i / (double)(colors.Length - 1)));
+                  }
+                  return brush;
+              }
+
+              private void AddDot(StackPanel parent, string id, string tip, Brush fill)
+              {
+                  var dot = new Border
+                  {
+                      Width = 24,
+                      Height = 24,
+                      CornerRadius = new CornerRadius(12),
+                      Background = fill,
+                      Margin = new Thickness(7, 0, 0, 0),
+                      Cursor = Cursors.Hand,
+                      ToolTip = tip,
+                      BorderThickness = new Thickness(1.5),
+                      BorderBrush = new SolidColorBrush(Color.FromArgb(0x66, 255, 255, 255))
+                  };
+                  dot.MouseLeftButtonUp += (_, e) =>
+                  {
+                      C21.ApplyTheme(id);
+                      e.Handled = true;
+                  };
+                  _dots.Add((id, dot));
+                  parent.Children.Add(dot);
+              }
+
+              private void Refresh(string selected)
+              {
+                  foreach (var (id, dot) in _dots)
+                  {
+                      var on = id == selected;
+                      dot.BorderThickness = new Thickness(on ? 3 : 1.5);
+                      dot.BorderBrush = on
+                          ? C21Ui.Hex("#FBBF24")
+                          : new SolidColorBrush(Color.FromArgb(0x66, 255, 255, 255));
+                  }
+              }
+          }
+          C21_EOF
+          cat > "$D/C21PingOkConverter.cs" <<'C21_EOF'
+          namespace v2rayN.Converters;
+
+          public class C21PingOkConverter : IValueConverter
+          {
+              public object Convert(object value, Type targetType, object parameter, System.Globalization.CultureInfo culture)
+              {
+                  return value?.ToString().ToInt() > 0;
+              }
+
+              public object? ConvertBack(object value, Type targetType, object parameter, System.Globalization.CultureInfo culture)
+              {
+                  return null;
+              }
+          }
+          C21_EOF
+          cat > "$D/apply_c21win.py" <<'C21_EOF'
+          import pathlib
+          import shutil
+          import sys
+
+          SRC = pathlib.Path(sys.argv[1])
+          ROOT = pathlib.Path("v2rayN")          # solution folder inside the repo
+          APPDIR = ROOT / "v2rayN"
+          LIB = ROOT / "ServiceLib"
+
+
+          def rd(p):
+              return p.read_text(encoding="utf-8")
+
+
+          def wr(p, s):
+              p.write_text(s, encoding="utf-8", newline="\n")
+
+
+          def sub(path, old, new, count=1):
+              s = rd(path)
+              found = s.count(old)
+              if found != count:
+                  sys.exit("PATCH FAILED in %s: expected %d match(es), found %d for:\n%s" % (path, count, found, old))
+              wr(path, s.replace(old, new))
+              print("patched", path)
+
+
+          def put(name, dest):
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(SRC / name, dest)
+              print("wrote", dest)
+
+
+          put("C21.cs", APPDIR / "C21.cs")
+          put("C21Views.cs", APPDIR / "Views/C21Views.cs")
+          put("C21PingOkConverter.cs", APPDIR / "Converters/C21PingOkConverter.cs")
+          if (SRC / "v2rayN.ico").exists():
+              put("v2rayN.ico", APPDIR / "Resources/v2rayN.ico")
+
+          # main window xaml
+          mx = APPDIR / "Views/MainWindow.xaml"
+          sub(mx, 'Title="v2rayN"', 'Title="Connected21"')
+          sub(mx, "</ToolBarTray>", '</ToolBarTray>\n                <view:C21Banner DockPanel.Dock="Top" />')
+          sub(mx, '<TextBlock Text="{x:Static resx:ResUI.menuPromotion}" />', '<TextBlock Text="خرید کانفیگ اختصاصی" />')
+
+          # main window code-behind
+          mc = APPDIR / "Views/MainWindow.xaml.cs"
+          sub(mc, "    public MainWindow()\n    {\n        InitializeComponent();",
+              "    public MainWindow()\n    {\n        C21.EnsureResources();\n        InitializeComponent();")
+          sub(mc, "        pbTheme.Content ??= new ThemeSettingView();\n",
+              "        pbTheme.Content ??= new ThemeSettingView();\n"
+              "        Loaded += (_, _) => C21.OnMainWindowLoaded(this);\n"
+              "        menuCheckUpdate.Visibility = Visibility.Collapsed;\n")
+          sub(mc, 'ProcUtils.ProcessStart($"{Utils.Base64Decode(Global.PromotionUrl)}?t={DateTime.Now.Ticks}");',
+              "ProcUtils.ProcessStart(C21.TelegramUrl);")
+
+          # server list: animated green/red lines around each server row
+          pv = APPDIR / "Views/ProfilesView.xaml"
+          sub(pv, '        <conv:DelayColorConverter x:Key="DelayColorConverter" />\n',
+              '        <conv:DelayColorConverter x:Key="DelayColorConverter" />\n'
+              '        <conv:C21PingOkConverter x:Key="C21PingOkConverter" />\n')
+          sub(pv, '                        <Style.Triggers>\n                            <DataTrigger Binding="{Binding IsActive}" Value="True">',
+              '                        <Style.Triggers>\n'
+              '                            <DataTrigger Binding="{Binding Delay, Converter={StaticResource C21PingOkConverter}}" Value="True">\n'
+              '                                <Setter Property="BorderBrush" Value="{DynamicResource C21PingGreen}" />\n'
+              '                                <Setter Property="BorderThickness" Value="0,2,0,2" />\n'
+              '                            </DataTrigger>\n'
+              '                            <DataTrigger Binding="{Binding Delay, Converter={StaticResource C21PingOkConverter}}" Value="False">\n'
+              '                                <Setter Property="BorderBrush" Value="{DynamicResource C21PingRed}" />\n'
+              '                                <Setter Property="BorderThickness" Value="0,2,0,2" />\n'
+              '                            </DataTrigger>\n'
+              '                            <DataTrigger Binding="{Binding IsActive}" Value="True">')
+
+          # automatic subscription update + ping of every server
+          pvm = LIB / "ViewModels/ProfilesViewModel.cs"
+          sub(pvm, "    public void ServerSpeedtestStop()", """    public async Task C21TestAll()
+              {
+                  var all = await AppManager.Instance.ProfileItems("");
+                  if (all is null || all.Count <= 0)
+                  {
+                      return;
+                  }
+
+                  var lstAll = JsonUtils.Deserialize<List<ProfileItem>>(JsonUtils.Serialize(all.OrderBy(t => t.Sort).ToList()));
+                  if (lstAll is null || lstAll.Count <= 0)
+                  {
+                      return;
+                  }
+
+                  _speedtestService ??= new SpeedtestService(_config, async (SpeedTestResult result) =>
+                  {
+                      RxSchedulers.MainThreadScheduler.Schedule(() =>
+                      {
+                          _ = SetSpeedTestResult(result);
+                      });
+                      await Task.CompletedTask;
+                  });
+                  _speedtestService?.RunLoop(ESpeedActionType.Realping, lstAll);
+              }
+
+              public void ServerSpeedtestStop()""")
+
+          mvm = LIB / "ViewModels/MainWindowViewModel.cs"
+          sub(mvm, "        await Reload();\n    }\n\n    #endregion Init", """        await Reload();
+
+                  _ = C21AutoStart();
+              }
+
+              private async Task C21AutoStart()
+              {
+                  await Task.Delay(1500);
+                  await C21Refresh();
+              }
+
+              /// <summary>Update every subscription (which re-tests everything afterwards), or just test when there are none.</summary>
+              private async Task C21Refresh()
+              {
+                  try
+                  {
+                      var subs = await AppManager.Instance.SubItems();
+                      if (subs != null && subs.Any(t => t.Enabled && t.Url.IsNotEmpty()))
+                      {
+                          await UpdateSubscriptionProcess("", false);
+                      }
+                      else
+                      {
+                          await ProfilesViewModel.C21TestAll();
+                      }
+                  }
+                  catch (Exception ex)
+                  {
+                      Logging.SaveLog("C21Refresh", ex);
+                  }
+              }
+
+              #endregion Init""")
+          sub(mvm, '        await Task.Run(async () => await SubscriptionHandler.UpdateProcess(_config, subId, blProxy, UpdateTaskHandler));\n',
+              '        await Task.Run(async () => await SubscriptionHandler.UpdateProcess(_config, subId, blProxy, UpdateTaskHandler));\n'
+              '        _ = ProfilesViewModel.C21TestAll();\n')
+          sub(mvm, "            NoticeManager.Instance.Enqueue(string.Format(ResUI.SuccessfullyImportedServerViaClipboard, ret));",
+              "            NoticeManager.Instance.Enqueue(string.Format(ResUI.SuccessfullyImportedServerViaClipboard, ret));\n            _ = C21Refresh();")
+          sub(mvm, "                NoticeManager.Instance.Enqueue(ResUI.SuccessfullyImportedServerViaScan);",
+              "                NoticeManager.Instance.Enqueue(ResUI.SuccessfullyImportedServerViaScan);\n                _ = C21Refresh();")
+
+          # never look for upstream updates (they would replace Connected21)
+          sub(LIB / "Manager/TaskManager.cs", "await UpdateTaskRunCheckUpdate();", "await Task.CompletedTask;")
+
+          print("ALL WINDOWS PATCHES APPLIED")
+          C21_EOF
+          cat > "$D/make_icon.py" <<'C21_EOF'
+          import sys
+          from PIL import Image, ImageDraw
+
+          OUT = sys.argv[1]
+          S = 1024
+
+
+          def lerp(a, b, t):
+              return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+          # diagonal violet -> cyan gradient
+          bg = Image.new("RGB", (S, S))
+          px = bg.load()
+          c1, c2 = (59, 27, 143), (8, 145, 178)
+          for y in range(S):
+              for x in range(S):
+                  px[x, y] = lerp(c1, c2, (x + y) / (2 * S))
+
+          mask = Image.new("L", (S, S), 0)
+          ImageDraw.Draw(mask).rounded_rectangle((0, 0, S - 1, S - 1), radius=int(S * 0.22), fill=255)
+          img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+          img.paste(bg, (0, 0), mask)
+
+          d = ImageDraw.Draw(img)
+          cx = cy = S // 2
+          r = int(S * 0.27)
+          w = int(S * 0.085)
+          d.arc((cx - r, cy - r, cx + r, cy + r), start=40, end=320, fill=(255, 255, 255, 255), width=w)
+          # round caps
+          import math
+          for ang in (40, 320):
+              rad = math.radians(ang)
+              x = cx + (r - w / 2) * math.cos(rad)
+              y = cy + (r - w / 2) * math.sin(rad)
+              d.ellipse((x - w / 2, y - w / 2, x + w / 2, y + w / 2), fill=(255, 255, 255, 255))
+          # gold node and white centre
+          gx = cx + r - w / 2 + int(S * 0.03)
+          d.ellipse((gx - S * 0.055, cy - S * 0.055, gx + S * 0.055, cy + S * 0.055), fill=(251, 191, 36, 255))
+          d.ellipse((cx - S * 0.04, cy - S * 0.04, cx + S * 0.04, cy + S * 0.04), fill=(255, 255, 255, 255))
+
+          sizes = [(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (24, 24), (16, 16)]
+          img.save(OUT, format="ICO", sizes=sizes)
+          img.resize((256, 256), Image.LANCZOS).save(OUT.replace(".ico", ".png"))
+          print("icon written", OUT)
+          C21_EOF
+          ls -la "$D"
+
+      - name: Make icon
+        run: |
+          python -m pip install pillow
+          python c21src/make_icon.py c21src/v2rayN.ico
+
+      - name: Apply Connected21 design
+        run: python c21src/apply_c21win.py c21src
+
+      - name: Build app
+        run: |
+          OUT="$GITHUB_WORKSPACE/out/app"
+          OUT="${OUT//\\//}"
+          mkdir -p "$OUT"
+          cd v2rayN
+          if ! dotnet publish ./AmazTool/AmazTool.csproj -c Release -r win-x64 -p:SelfContained=true -p:PublishTrimmed=true -p:EnableWindowsTargeting=true -p:IsAot=false -o "$OUT" > ../build-amaz.log 2>&1; then
+            grep -E "error " ../build-amaz.log | sort -u | head -40
+            tail -30 ../build-amaz.log
+            exit 1
+          fi
+          if ! dotnet publish ./v2rayN/v2rayN.csproj -c Release -r win-x64 -p:SelfContained=true -p:EnableWindowsTargeting=true -o "$OUT" > ../build-app.log 2>&1; then
+            echo "===== BUILD ERRORS ====="
+            grep -E "error " ../build-app.log | sort -u | head -60
+            echo "===== LAST LINES ====="
+            tail -30 ../build-app.log
+            exit 1
+          fi
+          find "$OUT" -type f \( -name '*.pdb' -o -name '*.debug' \) -delete
+          ls "$OUT" | head -30
+
+      - name: Package with Xray and sing-box cores
+        run: |
+          curl -L -f -o core.zip "https://github.com/2dust/v2rayN-core-bin/raw/refs/heads/master/v2rayN-windows-64.zip"
+          7z x core.zip -ocore_extract -y > /dev/null
+          echo "core zip layout:"
+          ls core_extract
+          TOP=core_extract
+          if [ "$(find core_extract -mindepth 1 -maxdepth 1 | wc -l)" = "1" ] && [ -d "$(find core_extract -mindepth 1 -maxdepth 1)" ]; then
+            TOP="$(find core_extract -mindepth 1 -maxdepth 1)"
+          fi
+          mkdir -p dist/Connected21
+          cp -r "$TOP"/. dist/Connected21/
+          cp -r out/app/. dist/Connected21/
+          cd dist
+          7z a -tzip ../Connected21-windows-64.zip Connected21 -mx1 > /dev/null
+          cd ..
+          ls -la Connected21-windows-64.zip
+
+      - name: Publish to Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="windows-$(date +%Y%m%d-%H%M%S)"
+          gh release create "$TAG" Connected21-windows-64.zip --title "Connected21 Windows $TAG" --notes "Connected21 for Windows (64-bit). Extract the zip and run v2rayN.exe inside the Connected21 folder."
+
+      - name: Backup copy as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Connected21-windows
+          path: Connected21-windows-64.zip
